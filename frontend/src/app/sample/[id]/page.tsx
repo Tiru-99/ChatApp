@@ -1,26 +1,78 @@
 "use client"
-
-import { Device } from "mediasoup-client";
-import { Transport } from "mediasoup-client/lib/types";
+import { io } from "socket.io-client";
+import { Device } from 'mediasoup-client';
+import { useParams } from "next/navigation"
+import { useMemo, useEffect, useState, useRef } from "react";
+import { v4 as uuidv4 } from "uuid";
 import { RtpCapabilities } from "mediasoup-client/lib/RtpParameters";
-import { io } from 'socket.io-client';
-import { useEffect, useState, useMemo, useRef } from 'react';
-import { useParams } from "next/navigation";
+import { LucidePcCase, Mic, MicOff, Video, VideoOff } from 'lucide-react';
+import { WebSocketEventType } from "@/lib/types";
+import {
+  DtlsParameters,
+  IceCandidate,
+  IceParameters,
+  MediaKind,
+  Producer,
+  Transport,
+  Consumer
+} from "mediasoup-client/lib/types";
+import { send } from "process";
 
-
-type ProducerResponse = {
+//types and interfaces 
+interface webRtcTransportParams {
   id: string;
-  producerSocketId: string;
-};
-
-interface ProducerInfo {
-  id: string,
-  kind: string
+  iceParameters: IceParameters;
+  iceCandidates: IceCandidate[];
+  dtlsParameters: DtlsParameters;
 }
 
+interface ProducerContainer {
+  producer_id: string;
+  userId: string;
+}
 
+interface Peer {
+  id: string;
+  name: string;
+}
 
-export default function Home() {
+type ConsumerEntry = {
+  consumer: Consumer;
+  userId: string;
+}
+
+interface RemoteStream {
+  consumer: Consumer;
+  stream: MediaStream;
+  kind: MediaKind;
+  producerId: string;
+  userId: string;
+}
+
+export default function Page() {
+  const roomId = useParams();
+  const userId = useMemo(() => uuidv4(), []);
+  console.log("the user id is", userId);
+  //refs 
+  const localVideoRef = useRef<MediaStream | null>(null);
+  const localStreamRef = useRef<HTMLVideoElement | null>(null);
+  const audioProducerRef = useRef<Producer | null>(null);
+  const videoProducerRef = useRef<Producer | null>(null);
+  const deviceRef = useRef<Device | null>(null);
+  const consumerTransportRef = useRef<Transport | null>(null);
+  const producerTransportRef = useRef<Transport | null>(null);
+  const consumers = useRef<Map<string, ConsumerEntry>>(new Map());
+  const consumedProducers = useRef<Set<string>>(new Set());
+
+  //states 
+  const [rtpCapabilities, setRtpCapabilities] = useState<RtpCapabilities>();
+  const [producers, setProducers] = useState<ProducerContainer[]>([]);
+  const [isMicOn, setIsMicOn] = useState<boolean>(true);
+  const [isVideoOn, setIsVideoOn] = useState<boolean>(true);
+  const [usersInRoom, setUsersInRoom] = useState<Peer[]>([]);
+  const [remoteStream, setRemoteStreams] = useState<RemoteStream[]>([]);
+  const [pausedVideoProducerIds, setPausedVideoProducerIds] = useState<string[]>([]);
+
 
   const socket = useMemo(
     () =>
@@ -30,374 +82,627 @@ export default function Home() {
     []
   );
 
-  const { id } = useParams();
-  const deviceRef = useRef<Device | null>(null);
-  const deviceReady = useRef<Device | null>(null);
-  const localVideoRef = useRef<HTMLVideoElement | null>(null);
-  const localStreamRef = useRef<MediaStream | null>(null);
-  const videoRefs = useRef<{ [key: string]: HTMLVideoElement }>({});
-  const [rtpCapabilities, setRtpCapabilities] = useState<RtpCapabilities>();
-  const [consumers, setConsumers] = useState<{ id: string; stream: MediaStream; kind: string; producerId: string }[]>([]);
-  const [producers, setProducers] = useState<ProducerInfo[]>([]);
-  const [userProducer, setUserProducer] = useState<string[]>([]);
-  const [fetchProducers, setFetchProducers] = useState<number>(0);
-  const [triggerConsumeMedia, setTriggerConsumeMedia] = useState<number>(0);
-  const consumerTransportRef = useRef<Transport | null>(null);
+  useEffect(() => {
+    //user joins a room , 
+    const init = async () => {
+      await loadEverything();
+      await startStreaming();
+    };
 
-  const waitForDeviceReady = () =>
-    new Promise<void>((resolve) => {
-      const check = () => {
-        if (deviceRef.current && deviceRef.current.loaded) {
-          resolve();
-        } else {
-          setTimeout(check, 50); // Keep checking every 50ms
-        }
-      };
-      check();
+    init();
+
+    socket.onAny((event, args) => {
+      routeIncommingEvents({ event, args });
     });
 
-
-
-  useEffect(() => {
-    const handleNewProducer = async ({ producerId, kind }: { producerId: string; kind: string }) => {
-      await waitForDeviceReady(); // ⏳ wait until device is ready
-      console.log("the producer kind is", kind);
-      console.log("new producer joined and event triggered", producerId);
-      consumeMediaForSingleProducer(producerId, kind);
+    const handleBeforeUnload = async (event: any) => {
+      const response = await sendRequest(WebSocketEventType.EXIT_ROOM, { userId });
+      console.log("this is the response", response);
+      event.preventDefault();
+      event.returnValue = '';
     };
 
-    socket.on("newProducer", handleNewProducer);
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
 
     return () => {
-      socket.off("newProducer", handleNewProducer);
+      //cleanup
+      window.removeEventListener("beforeunload", handleBeforeUnload);
     };
+
+  }, [roomId]);
+
+
+
+  useEffect(() => {
+    //consume all the producers 
+    if (producers && producers.length > 0) {
+      producers.forEach((producer) => {
+        if (!consumedProducers.current.has(producer.producer_id)) {
+          console.log("The producers are : ", producer);
+          consume(producer.producer_id);
+          consumedProducers.current.add(producer.producer_id);
+        }
+      });
+    }
+
+  }, [roomId, producers]);
+
+
+  useEffect(() => {
+    //clean up producers while turning on mic and video; 
+    console.log("coming into producer cleanup useeffect");
+    const handleProducerCleanup = (producerId: string) => {
+      setRemoteStreams(prev =>
+        prev.filter(stream => stream.producerId !== producerId)
+      );
+    };
+
+    socket.on("producer-cleanup", handleProducerCleanup);
+
+    return () => {
+      socket.off("producer-cleanup", handleProducerCleanup);
+    }
   }, []);
 
-
+  //getting the paused producers 
   useEffect(() => {
-    const fetchAndConsumeProducers = async () => {
-      await waitForDeviceReady(); // ⏳ wait until device is ready
-  
-      // IIFE to immediately invoke createConsumer calls
-      (() => {
-        createConsumer("video");
-        createConsumer("audio");
-      })();
-  
-      socket.emit("getProducers", { id }, (producerInfo: ProducerInfo[]) => {
-        console.log("Producer IDs received", producerInfo);
-        setProducers(producerInfo);
-        consumeMedia(producerInfo); // ✅ consume only after device is ready
-      });
-    };
-  
-    fetchAndConsumeProducers();
-  }, [fetchProducers]);
-  
+    const getPausedProducers = (pausedProducers : string[]) => {
+      if(!pausedProducers){
+        console.log("No paused producers received");
+      }
+      console.log("UE PP :" , pausedProducers);
+      setPausedVideoProducerIds(pausedProducers);
+    };  
 
-  // Dynamically assign streams to video elements
+    socket.on(WebSocketEventType.GET_PAUSED_PRODUCERS , getPausedProducers);
+
+    return () => {
+      socket.off(WebSocketEventType.GET_PAUSED_PRODUCERS , getPausedProducers); 
+    }
+  },[socket])
 
 
 
-  // useEffect(() => {
-  //   if (producers && producers.length > 0) {
-  //     // Filter out producers that have already been consumed
-  //     const newProducers = producers.filter((producerId) => !consumers.some((consumer) => consumer.id === producerId));
-  //     if (newProducers.length > 0) {
-  //       consumeMedia(newProducers);
-  //     }
-  //   }
-  // }, [consumers , producers]);
+  const sendRequest = (eventType: string, data: any): Promise<any> => {
+    return new Promise((resolve, reject) => {
+      socket.emit(eventType, data, (response: any) => {
+        if (response.error) {
+          reject(new Error(response.error))
+        } else {
+          resolve(response)
+        }
+      })
+    })
+  }
 
-  useEffect(() => {
-    //creating a room 
-    socket.emit("join-meet", id, (response: { success: boolean, error?: string }) => {
-      if (!response.success) {
-        console.error("Error joining meet:", response.error);
+
+  const routeIncommingEvents = ({
+    event,
+    args,
+  }: {
+    event: WebSocketEventType;
+    args: any;
+  }) => {
+    switch (event) {
+      case WebSocketEventType.USER_JOINED:
+        userJoined(args);
+        break;
+
+      case WebSocketEventType.USER_LEFT:
+        userLeft(args);
+        break;
+
+      case WebSocketEventType.NEW_PRODUCERS:
+        newProducers(args);
+        break;
+
+      case WebSocketEventType.PRODUCER_CLOSED:
+        closedProducers(args);
+        break;
+
+      default:
+        break;
+    }
+  };
+
+  const closedProducers = (args: ProducerContainer) => {
+    setProducers((v) =>
+      v.filter((prod) => prod.producer_id !== args.producer_id)
+    );
+  };
+
+  const closeProducer = (producer_id: string) => {
+    sendRequest(WebSocketEventType.CLOSE_PRODUCER, { producer_id });
+  };
+
+  const newProducers = (args: ProducerContainer[] | ProducerContainer) => {
+    console.log("Received new producers:", args);
+
+    // Handle both single object and array cases
+    const producersArray = Array.isArray(args) ? args : [args];
+
+    setProducers((v) => {
+      // Make sure v is always an array
+      const currentProducers = Array.isArray(v) ? v : [];
+      return [...currentProducers, ...producersArray];
+    });
+  };
+
+  const userLeft = (args: any) => {
+    const leftUser = args.user as Peer;
+    //leaving producerIds 
+    const producerIds = args.leavingProducers;
+
+    console.log("User who left:", leftUser, producerIds);
+
+    // Remove that user from the room UI
+    setUsersInRoom((v) => v.filter((peer) => peer.id !== leftUser.id));
+
+    setRemoteStreams((streams) => {
+      const filtered = streams.filter(
+        (stream) => !producerIds.includes(stream.producerId)
+      );
+      return filtered;
+    });
+
+    console.log("✅ Cleanup done for user:", leftUser.id);
+  };
+
+
+  const userJoined = (args: any) => {
+    const user = args.user as Peer;
+    setUsersInRoom((v) => [...v, user]);
+  };
+
+  const joinRoom = async () => {
+    const response = await sendRequest(WebSocketEventType.JOIN_ROOM, { userId, roomId: roomId.id, name: "tiru" });
+    console.log(response);
+    return response;
+  }
+
+  const getRtpCapabilities = async () => {
+    const response = await sendRequest(WebSocketEventType.GET_ROUTER_RTP_CAPABILITIES, {});
+    console.log(response);
+    //create a device
+    try {
+      const device = new Device();
+      deviceRef.current = device;
+      await device.load({ routerRtpCapabilities: response.rtpCapabilities });
+      console.log("Device loaded successfully");
+    } catch (error) {
+      console.log("Something went wrong in device", error);
+    }
+    return response;
+  }
+
+  const getCurrentUsers = async () => {
+    const response = await sendRequest(WebSocketEventType.GET_IN_ROOM_USERS, {});
+    console.log(response);
+    return response;
+  }
+
+  const createAndConnectConsumerTransports = async () => {
+    //create web rtc transport and then connect that 
+    console.log("Consumer phase 1 cleared");
+    try {
+      if (consumerTransportRef.current) {
+        console.log("Already a consumer transport present");
         return;
       }
 
-      socket.emit("getRouterRtpCapabilities", {}, async (capabilities: RtpCapabilities) => {
-        console.log("RTP capabilities received", capabilities)
-        setRtpCapabilities(capabilities);
+      const data = (await sendRequest(
+        WebSocketEventType.CREATE_WEBRTC_TRANSPORT,
+        { forceTcp: false, userId: userId }
+      )) as { params: webRtcTransportParams };
 
-        //load a device here
-        const device = new Device();
-        console.log("The device 1 is", device);
-        deviceRef.current = device;
-        try {
-          await device.load({ routerRtpCapabilities: capabilities });
-          console.log("Mediasoup device successfully initiated");
-        } catch (err) {
-          console.error(" Error loading Mediasoup device", err);
-          return;
+      if (!data) {
+        throw new Error("No Consumer Transport Created");
+      }
+      console.log("Consumer transport created", data);
+
+      if (!deviceRef.current) {
+        console.log("No device found");
+        return;
+      }
+      console.log("Consumer Phase 3");
+      consumerTransportRef.current = deviceRef.current?.createRecvTransport(data.params);
+      console.log("The consumer Transport Ref is ", consumerTransportRef.current.id);
+      consumerTransportRef.current.on("connect", async ({ dtlsParameters }, cb, eb) => {
+        sendRequest(WebSocketEventType.CONNECT_TRANSPORT, {
+          userId: userId,
+          transportId: consumerTransportRef.current?.id,
+          dtlsParameters,
+        })
+          .then(cb)
+          .catch(eb);
+      });
+      console.log("Consumer Phase 4 ");
+
+      consumerTransportRef.current.on("connectionstatechange", (state) => {
+        console.log("Consumer state", state);
+        if (state === "connected") {
+          console.log("--- Connected Consumer Transport ---");
+        }
+        if (state === "disconnected") {
+          consumerTransportRef.current?.close();
         }
       });
-      // create consumer transport  
-      // connect consumer transport
-
-      handleStartCamera().then(() => {
-        produceMedia();
-      })
-
-    });
-    //get rtp capabilities from the server 
-
-
-    return () => {
-      socket.emit("disconnect")
-    }
-
-  }, [socket]);
-
-
-  const produceMedia = async () => {
-    try {
-      socket.emit("createProducerTransport", {}, async (params: any) => {
-        console.log("params for producer transport received", params);
-        if (!params || !deviceRef.current) return null;
-
-        const producerTransport = deviceRef.current.createSendTransport(params);
-
-        const { socketId } = params;
-
-
-        // Handle connection event
-        producerTransport.on("connect", async ({ dtlsParameters }, callback) => {
-          try {
-            console.log("The code is reaching in the producer connect part");
-            socket.emit("connectProducerTransport", { dtlsParameters, socketId });
-            console.log("Producer connected successfully");
-            callback();
-          } catch (error) {
-            console.log("Something went wrong while connection producer transport", error);
-          }
-        });
-
-        producerTransport.on("produce", async ({ kind, rtpParameters }: any, callback: (data: ProducerResponse) => void) => {
-          try {
-            socket.emit(
-              "produce",
-              { kind, rtpParameters },
-              ({ id, producerSocketId }: { id: string; producerSocketId: string }) => {
-                const response: ProducerResponse = { id, producerSocketId };
-
-                console.log("Producer Response:", response); // Logs the correct structure
-                console.log("Producer ID:", response.id); // Accessing the correct `id`
-                setUserProducer((prev) => [...prev, response.id]);
-                callback(response); // Passing the correct object
-
-                setTriggerConsumeMedia((prev) => prev + 1);
-              }
-            );
-          } catch (error) {
-            console.error("Something went wrong while producing", error);
-          }
-        }
-        );
-
-
-        // THIS IS WHAT WAS MISSING - Actually produce media after setting up the transport
-        if (localStreamRef.current) {
-          try {
-            for (const track of localStreamRef.current.getTracks()) {
-              console.log("Producing track:", track.kind);
-              const producer = await producerTransport.produce({ track });
-              console.log("Producer created:", producer.id);
-            }
-          } catch (error) {
-            console.error("Error producing media:", error);
-          }
-        } else {
-          console.error("No local stream available to produce");
-        }
-      });
+      console.log("Consumer transport setup successfull");
     } catch (error) {
-      console.error("Something went wrong while initiating the  producer");
+      console.log("Something went wrong while consumer transport", error);
     }
   }
 
-  const createConsumer = async (kind: string) => {
-    if (!kind) {
-      console.log("Incoming kind not found");
+  console.log("the producers state are", producers);
+
+  const getProducers = async () => {
+    console.log("In the get producers part");
+    const { producerList } = (await sendRequest(
+      WebSocketEventType.GET_PRODUCERS,
+      {}
+    )) as { producerList: ProducerContainer[] };
+
+    if (!producerList) {
+      console.log("No producers to send found");
       return;
     }
+    setProducers(producerList);
 
-    socket.emit("createConsumerTransport", { kind }, async (params: any) => {
-      if (!params || !deviceRef.current) return;
+  };
 
-      console.log("device state", deviceRef.current?.loaded);
 
-      console.log("The params are", params);
-      console.log("The deviceRef current is", deviceRef.current);
+  const createProducerTransport = async () => {
+    if (deviceRef.current) {
+      console.log("resp");
 
-      const consumerTransport = deviceRef.current.createRecvTransport(params)
-      console.log("Consumer Transport methods:", consumerTransport.connectionState);
-      consumerTransportRef.current = consumerTransport;
-
-      const { socketId } = params;
-      console.log("📢 Registering consumer transport event listeners...");
-      consumerTransport.on("connect", async ({ dtlsParameters }, callback, errback) => {
-        try {
-          socket.emit("connectConsumerTransport", { dtlsParameters, socketId, kind }, () => {
-            console.log("Consumer transport connected successfully!");
-          });
-          callback();
-          console.log("Consumer created successfully");
-          // consumeAllProducers(params);
-        } catch (error) {
-          console.error("Error connecting consumer transport", error);
+      const resp = (await sendRequest(
+        WebSocketEventType.CREATE_WEBRTC_TRANSPORT,
+        {
+          forceTcp: false,
+          userId: userId,
+          rtpCapabilities: deviceRef.current.rtpCapabilities,
         }
-      });
-    })
+      )) as { params: webRtcTransportParams };
+      console.log(resp);
 
-  }
+      producerTransportRef.current = deviceRef.current.createSendTransport(resp.params);
 
-  const consumeMediaForSingleProducer = async (producerId: string, kind: string) => {
+      console.log("--- CREATE PRODUCER TRANSPORT ---");
 
-    if (!producerId) {
-      console.log("No incoming producer to consume.");
-      return;
-    }
-
-    const alreadyExists = userProducer.includes(producerId) || consumers.some((c) => c.producerId === producerId);
-    if (alreadyExists) {
-      console.log("Already consuming this producer:", producerId);
-      return;
-    }
-
-
-    socket.emit(
-      "consume",
-      {
-        producerId, // The socket ID of the producer whose media we want to consume
-        rtpCapabilities: deviceRef.current?.rtpCapabilities,
-        kind // The Mediasoup device's RTP capabilities
-      },
-      async (data: any) => {
-        console.log("The code is reacheing here in the cosumer section")
-        console.log("The data from the backend is", data);
-        if (data.error) {
-          console.error("Error consuming:", data.error);
-          return;
-        }
+      if (producerTransportRef.current) {
         try {
-          if (!consumerTransportRef.current) {
-            console.log("Consumer Transport Ref not found !");
-            return;
-          }
-
-          const consumer = await consumerTransportRef.current.consume({
-            id: data.id,
-            producerId: data.producerId,
-            kind: data.kind,
-            rtpParameters: data.rtpParameters,
+          producerTransportRef.current.on("connect", ({ dtlsParameters }, cb, eb) => {
+            sendRequest(WebSocketEventType.CONNECT_TRANSPORT, {
+              userId: userId,
+              transportId: producerTransportRef.current!.id,
+              dtlsParameters,
+            })
+              .then(cb)
+              .catch(eb);
           });
 
-          socket.emit("consumer-resume", { consumerId: data.id });
 
-          console.log("Consumer created successfully:", consumer);
+          producerTransportRef.current.on(
+            "produce",
+            async ({ kind, rtpParameters }, cb, eb) => {
+              try {
+                const { producer_id } = (await sendRequest(
+                  WebSocketEventType.PRODUCE,
+                  {
+                    userId: userId,
+                    producerTransportId: producerTransportRef.current!.id,
+                    kind,
+                    rtpParameters,
+                  }
+                )) as { producer_id: string };
 
-          // Create a new media stream and store it
-          // Create a new media stream and store it
-          const newStream = new MediaStream([consumer.track]);
-          setConsumers((prevConsumers) => [
-            ...prevConsumers,
-            { id: consumer.id, stream: newStream, kind: consumer.kind, producerId: data.producerId },
-          ]);
+                console.log(producer_id);
+
+                cb({ id: producer_id });
+              } catch (error) {
+                console.log(error);
+
+                eb(new Error(String(error)));
+              }
+            }
+          );
+
+          producerTransportRef.current.on("connectionstatechange", (state) => {
+            console.log(state);
+            switch (state) {
+              case "disconnected":
+                producerTransportRef.current?.close();
+                console.log("Producer disconnected");
+                break;
+            }
+          });
+
+
+          return true;
         } catch (error) {
-          console.error("Error creating MediaStream:", error);
+          console.log("Producer Creation error :: ", error);
         }
       }
-    );
+    }
+  };
 
+  const consume = async (producerId: string) => {
+    consumeProducers(producerId).then((data) => {
+      console.log("The producer Id inside consume is", producerId);
+      if (!data) {
+        console.log("Consumer not found!");
+        return;
+      }
+      const { consumer, kind } = data;
+      consumers.current.set(consumer.id, { consumer, userId });
+      if (kind === "video" || kind === "audio") {
+        setRemoteStreams((v) => [...v, data]);
+      }
+    })
+  }
+  console.log("The consumers are ", consumers.current);
+  console.log("The remote streams are ", remoteStream);
+
+  const consumeProducers = async (producerId: string) => {
+    if (!deviceRef.current || !consumerTransportRef.current) {
+      console.log("incomplete refs in consume");
+      return;
+    }
+    console.log("The code is reaching here in the consumer part");
+    const rtpCapabilities = deviceRef.current.rtpCapabilities;
+    console.log("the rttp ils ", rtpCapabilities);
+    const data = await sendRequest(WebSocketEventType.CONSUME, {
+      userId: userId,
+      rtpCapabilities,
+      consumerTransportId: consumerTransportRef.current.id,
+      producerId,
+    });
+
+    //s
+
+    console.log("The data is ", data);
+
+    const { id, kind, rtpParameters } = data;
+    console.log("Comsumer_Data", data);
+
+    const consumer = await consumerTransportRef.current.consume({
+      id,
+      producerId,
+      kind,
+      rtpParameters
+    });
+    console.log('the consumer is', consumer);
+    const stream = new MediaStream();
+    stream.addTrack(consumer.track);
+    console.log("The stream is set", consumer, stream, kind, producerId);
+    return {
+      userId: userId,
+      consumer,
+      stream,
+      kind,
+      producerId
+    }
+  }
+
+  //write a logic for consumer 
+  // write a logic to consume all the producers 
+  // write a logic to detect new producers and consumer it 
+  // write a logic to close the producers 
+
+  const loadEverything = async () => {
+    await joinRoom();
+    await getRtpCapabilities();
+    await getCurrentUsers();
+    await createAndConnectConsumerTransports();
+    await createProducerTransport();
+    await getProducers();
   }
 
 
-  const consumeMedia = async (producerInfo: ProducerInfo[]) => {
-    if (!Array.isArray(producerInfo) || producerInfo.length === 0) {
-      console.warn("⚠️ No producers available to consume.");
-      return;
-    }
-
-    console.log("Available producers to consume:", producerInfo);
-
-    // Filter out own producers
-    const filteredProducers = producerInfo.filter(
-      (producer) => !userProducer.includes(producer.id)
-    );
-
-    if (filteredProducers.length === 0) {
-      console.log("No external producers to consume.");
-      return;
-    }
-
-
-    for (const { id: producerId, kind } of filteredProducers) {
-      await consumeMediaForSingleProducer(producerId, kind);
-    }
-  };
-
-
-  const handleStartCamera = async () => {
-    if (!localVideoRef.current) return null;
+  const startStreaming = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localVideoRef.current.srcObject = stream;
-      console.log("The code is coming into handle start camera");
-      localVideoRef.current.play().catch(err => console.error("Error playing local video:", err));
-      localStreamRef.current = stream;
-    } catch (error) {
-      console.error("Error accessing media devices:", error);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+
+      const videoTrack = stream.getVideoTracks()[0];
+      const audioTrack = stream.getAudioTracks()[0];
+
+      // Store the local stream if needed (for preview)
+      if (localStreamRef.current) {
+        localStreamRef.current.srcObject = stream;
+      }
+
+      if (producerTransportRef.current) {
+        // Produce video
+        const videoProducer = await producerTransportRef.current.produce({
+          track: videoTrack,
+        });
+
+        // Produce audio
+        const audioProducer = await producerTransportRef.current.produce({
+          track: audioTrack,
+        });
+
+        // Optionally store both producers
+        videoProducerRef.current = videoProducer;
+        audioProducerRef.current = audioProducer;
+      }
+    } catch (err) {
+      console.error("Error starting stream:", err);
     }
   };
 
-  console.log("The consumers are ", consumers)
+  const turnMicOn = async () => {
+    if (!isMicOn) {
+      // Turn ON
+      console.log("Mic triggered")
+      if (audioProducerRef.current) {
+        audioProducerRef.current.resume();
+      }
+      setIsMicOn(true);
+    } else {
+      // Turn OFF
+      if (audioProducerRef.current) {
+        audioProducerRef.current.pause();
+      }
+      setIsMicOn(false);
+    }
+  };
+
+  console.log("video on state", isVideoOn);
+  console.log("audio on state", isMicOn);
+  console.log("paused Producers" , pausedVideoProducerIds);
+
+  const turnVideoOn = async () => {
+    if (!isVideoOn) {
+      // TURN ON
+      try {
+        if (videoProducerRef.current) {
+          const videoProducerId = videoProducerRef.current.id;
+          await videoProducerRef.current.resume();
+  
+          const response = await sendRequest(WebSocketEventType.REMOVE_PAUSED_PRODUCER, { videoProducerId });
+          if (response.error) {
+            console.error("Error removing paused producer:", response.error);
+          }
+        }
+        setIsVideoOn(true);
+      } catch (error) {
+        console.log("Video error:", error);
+      }
+    } else {
+      // TURN OFF
+      try {
+        if (videoProducerRef.current) {
+          const videoProducerId = videoProducerRef.current.id;
+          await videoProducerRef.current.pause();
+  
+          const response = await sendRequest(WebSocketEventType.ADD_PAUSED_PRODUCER, { videoProducerId });
+          if (response.error) {
+            console.error("Error adding paused producer:", response.error);
+          }
+        }
+        setIsVideoOn(false);
+      } catch (error) {
+        console.log("Video pause error:", error);
+      }
+    }
+  };
+  
+
 
 
   return (
-    <div>
-      <h1>Welcome to the tiru meet application</h1>
-      <div>
-        <video ref={localVideoRef} autoPlay playsInline muted></video>
-      </div>
+    <div className="bg-gradient-to-br from-zinc-900 via-black to-zinc-800 min-h-screen relative p-6">
+      <h1 className="text-3xl font-semibold text-center mb-8 text-white tracking-wide">
+        🎥 Video Calling App
+      </h1>
 
-      <div className="grid grid-cols-2 gap-4">
-        {consumers
-          .filter(({ kind }) => kind === "video") // Only include video streams
-          .map(({ id, stream }) => (
-            <video
-              key={id}
-              ref={(el) => {
-                if (el && stream) {
-                  el.srcObject = stream;
-                  el.autoplay = true;
-                  el.playsInline = true;
-                }
+      {/* Local Stream */}
+      <section className="fixed bottom-6 right-6 z-50">
+        <div className="w-60 rounded-xl overflow-hidden shadow-xl backdrop-blur bg-white/5 border border-white/10 relative">
+          <video
+            autoPlay
+            muted
+            playsInline
+            ref={localStreamRef}
+            className="w-full h-full object-contain"
+          />
+
+          {/* Controls */}
+          <div className="absolute bottom-2 left-1/2 transform -translate-x-1/2 flex gap-4">
+            <button
+              onClick={turnMicOn}
+              className="bg-black/30 hover:bg-black/50 text-white p-2 rounded-full"
+            >
+              <Mic></Mic>
+            </button>
+            <button
+              onClick={turnVideoOn}
+              className="bg-black/30 hover:bg-black/50 text-white p-2 rounded-full"
+            >
+              <Video></Video>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {/* Remote Video Streams */}
+      <div
+        className={`
+          w-full gap-6 px-2 md:px-6 pb-20
+          ${remoteStream.length === 2 ? "grid grid-cols-1" : ""}
+          ${remoteStream.length === 4 ? "flex flex-col md:flex-row" : ""}
+          ${remoteStream.length === 6 ? "flex flex-wrap justify-center" : ""}
+          ${remoteStream.length > 6 ? "grid grid-cols-2 md:grid-cols-2" : ""}
+        `}
+        style={{ height: "100vh", overflow: "auto" }}
+      >
+        {remoteStream
+          .filter(({ kind }) => kind === "video")
+          .map(({ stream, producerId }, index) => (
+            <div
+              key={index}
+              className="rounded-xl overflow-hidden bg-white/5 backdrop-blur shadow-lg border border-white/10"
+              style={{
+                maxWidth:
+                  remoteStream.length === 2
+                    ? "100%"
+                    : remoteStream.length === 4
+                      ? "48%"
+                      : remoteStream.length === 6
+                        ? "30%"
+                        : "100%",
               }}
-              className="w-full h-auto rounded-lg shadow-md"
-            />
+            >
+              {!pausedVideoProducerIds.includes(producerId) ? (
+                <video
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full h-full object-contain aspect-video"
+                  ref={(videoElement) => {
+                    if (videoElement) {
+                      videoElement.srcObject = stream;
+                    }
+                  }}
+                />
+              ) : (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-black text-white">
+                  <img
+                    src={"/default-avatar.png"}
+                    alt={`tiru's avatar`}
+                    className="w-16 h-16 rounded-full mb-2"
+                  />
+                  <span className="text-lg font-medium">{"Tiru"}</span>
+                </div>
+              )}
+            </div>
           ))}
       </div>
 
-      <div>
-      {consumers
-        .filter(({ kind }) => kind === "audio")
-        .map(({ id, stream }) => (
-          <audio
-            key={id}
-            ref={(el) => {
-              if (el && stream) {
-                el.srcObject = stream;
-                el.autoplay = true;
-                el.play().catch(err => console.error("Error playing audio:", err));
-              }
-            }}
-          />
-        ))}
-      </div>
-
+      {/* Remote Audio Streams */}
+      <section>
+        {remoteStream
+          ?.filter(({ kind }) => kind === "audio")
+          .map(({ stream }, index) => (
+            <div key={index} className="hidden">
+              <audio
+                autoPlay
+                ref={(audioElement) => {
+                  if (audioElement) {
+                    audioElement.srcObject = stream;
+                  }
+                }}
+              />
+            </div>
+          ))}
+      </section>
     </div>
   );
+
 
 }
