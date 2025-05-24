@@ -1,11 +1,14 @@
-"use client"
+'use client'
+
 import { io } from "socket.io-client";
 import { Device } from 'mediasoup-client';
 import { useParams } from "next/navigation"
 import { useMemo, useEffect, useState, useRef } from "react";
-import { v4 as uuidv4 } from "uuid";
+import { Toaster , toast } from "sonner"
+import useAuth from "@/hooks/useAuth";
+import { useRouter } from "next/navigation";
 import { RtpCapabilities } from "mediasoup-client/lib/RtpParameters";
-import { LucidePcCase, Mic, MicOff, Video, VideoOff } from 'lucide-react';
+import { Phone, Mic, MicOff, Video, VideoOff } from 'lucide-react';
 import { WebSocketEventType } from "@/lib/types";
 import {
   DtlsParameters,
@@ -16,7 +19,8 @@ import {
   Transport,
   Consumer
 } from "mediasoup-client/lib/types";
-import { send } from "process";
+
+
 
 //types and interfaces 
 interface webRtcTransportParams {
@@ -36,6 +40,11 @@ interface Peer {
   name: string;
 }
 
+interface UserDetails {
+  userId : string , 
+  name : string 
+}
+
 type ConsumerEntry = {
   consumer: Consumer;
   userId: string;
@@ -50,11 +59,12 @@ interface RemoteStream {
 }
 
 export default function Page() {
+
+  //params
   const roomId = useParams();
-  const userId = useMemo(() => uuidv4(), []);
-  console.log("the user id is", userId);
+
   //refs 
-  const localVideoRef = useRef<MediaStream | null>(null);
+
   const localStreamRef = useRef<HTMLVideoElement | null>(null);
   const audioProducerRef = useRef<Producer | null>(null);
   const videoProducerRef = useRef<Producer | null>(null);
@@ -65,6 +75,9 @@ export default function Page() {
   const consumedProducers = useRef<Set<string>>(new Set());
 
   //states 
+  const [userId, setUserId] = useState<string>();
+  const [toastMessage , setToastMessage] = useState<string>();
+  const [username, setUserName] = useState<string>(); 
   const [rtpCapabilities, setRtpCapabilities] = useState<RtpCapabilities>();
   const [producers, setProducers] = useState<ProducerContainer[]>([]);
   const [isMicOn, setIsMicOn] = useState<boolean>(true);
@@ -82,7 +95,37 @@ export default function Page() {
     []
   );
 
+  //Auth guard variables
+  const {isAuthenticated , isLoading} = useAuth(); 
+  const router = useRouter(); 
+
+  useEffect(()=>{
+    console.log("Coming in auth UseEffect");
+      if(isAuthenticated === false && !isLoading){
+          toast.error("You are not logged in");
+          router.replace("/login");
+      }
+  },[isAuthenticated , isLoading])
+
   useEffect(() => {
+    const storedUserId = localStorage.getItem("userId");
+    const storedName = localStorage.getItem("username");
+      if (!storedUserId || !storedName) {
+        console.log("No stored user");
+        return;
+      }
+
+    setUserId(storedUserId);
+    setUserName(storedName);
+
+  }, [])
+
+  // console.log("the user id is", userId , username);
+  useEffect(() => {
+    if(isAuthenticated === false || isLoading || !username) {
+      console.log("taking some time , " , isAuthenticated , isLoading); 
+      return ; 
+    }
     //user joins a room , 
     const init = async () => {
       await loadEverything();
@@ -102,15 +145,13 @@ export default function Page() {
       event.returnValue = '';
     };
 
-
     window.addEventListener("beforeunload", handleBeforeUnload);
 
     return () => {
       //cleanup
       window.removeEventListener("beforeunload", handleBeforeUnload);
     };
-
-  }, [roomId]);
+  }, [roomId , isAuthenticated]);
 
 
 
@@ -130,6 +171,7 @@ export default function Page() {
 
 
   useEffect(() => {
+   
     //clean up producers while turning on mic and video; 
     console.log("coming into producer cleanup useeffect");
     const handleProducerCleanup = (producerId: string) => {
@@ -147,6 +189,7 @@ export default function Page() {
 
   //getting the paused producers 
   useEffect(() => {
+    
     const getPausedProducers = (pausedProducers : string[]) => {
       if(!pausedProducers){
         console.log("No paused producers received");
@@ -164,6 +207,7 @@ export default function Page() {
 
 
 
+  //send request template
   const sendRequest = (eventType: string, data: any): Promise<any> => {
     return new Promise((resolve, reject) => {
       socket.emit(eventType, data, (response: any) => {
@@ -176,7 +220,7 @@ export default function Page() {
     })
   }
 
-
+  //router for socket.on events from the server
   const routeIncommingEvents = ({
     event,
     args,
@@ -235,6 +279,7 @@ export default function Page() {
     const producerIds = args.leavingProducers;
 
     console.log("User who left:", leftUser, producerIds);
+    toast(`${leftUser.name} left the call`);
 
     // Remove that user from the room UI
     setUsersInRoom((v) => v.filter((peer) => peer.id !== leftUser.id));
@@ -248,15 +293,17 @@ export default function Page() {
 
     console.log("✅ Cleanup done for user:", leftUser.id);
   };
-
+  console.log("The users in room are " , usersInRoom);
 
   const userJoined = (args: any) => {
     const user = args.user as Peer;
+    console.log("The user is joined , ", user);
+    toast(`${user.name} has joined the call`)
     setUsersInRoom((v) => [...v, user]);
   };
 
   const joinRoom = async () => {
-    const response = await sendRequest(WebSocketEventType.JOIN_ROOM, { userId, roomId: roomId.id, name: "tiru" });
+    const response = await sendRequest(WebSocketEventType.JOIN_ROOM, { userId, roomId: roomId.id, name : username });
     console.log(response);
     return response;
   }
@@ -277,8 +324,10 @@ export default function Page() {
   }
 
   const getCurrentUsers = async () => {
-    const response = await sendRequest(WebSocketEventType.GET_IN_ROOM_USERS, {});
-    console.log(response);
+    const response = await sendRequest(WebSocketEventType.GET_IN_ROOM_USERS , {});
+    console.log("The current users are response: " , response);
+    const { users } = response ; 
+    setUsersInRoom(users)
     return response;
   }
 
@@ -435,9 +484,15 @@ export default function Page() {
         return;
       }
       const { consumer, kind } = data;
+      if(!userId){
+        return; 
+      }
       consumers.current.set(consumer.id, { consumer, userId });
       if (kind === "video" || kind === "audio") {
-        setRemoteStreams((v) => [...v, data]);
+        setRemoteStreams((v) => [
+          ...v,
+          { ...data, userId: userId! }, // non-null assertion
+        ]);
       }
     })
   }
@@ -485,10 +540,6 @@ export default function Page() {
     }
   }
 
-  //write a logic for consumer 
-  // write a logic to consume all the producers 
-  // write a logic to detect new producers and consumer it 
-  // write a logic to close the producers 
 
   const loadEverything = async () => {
     await joinRoom();
@@ -552,9 +603,9 @@ export default function Page() {
     }
   };
 
-  console.log("video on state", isVideoOn);
-  console.log("audio on state", isMicOn);
-  console.log("paused Producers" , pausedVideoProducerIds);
+  // console.log("video on state", isVideoOn);
+  // console.log("audio on state", isMicOn);
+  // console.log("paused Producers" , pausedVideoProducerIds);
 
   const turnVideoOn = async () => {
     if (!isVideoOn) {
@@ -562,7 +613,7 @@ export default function Page() {
       try {
         if (videoProducerRef.current) {
           const videoProducerId = videoProducerRef.current.id;
-          await videoProducerRef.current.resume();
+          videoProducerRef.current.resume();
   
           const response = await sendRequest(WebSocketEventType.REMOVE_PAUSED_PRODUCER, { videoProducerId });
           if (response.error) {
@@ -578,7 +629,7 @@ export default function Page() {
       try {
         if (videoProducerRef.current) {
           const videoProducerId = videoProducerRef.current.id;
-          await videoProducerRef.current.pause();
+          videoProducerRef.current.pause();
   
           const response = await sendRequest(WebSocketEventType.ADD_PAUSED_PRODUCER, { videoProducerId });
           if (response.error) {
@@ -591,15 +642,27 @@ export default function Page() {
       }
     }
   };
-  
 
+  const getUserNameByProducerId = (producerId: string): string => {
+    console.log("The producerId is" , producerId);
+    const producer = producers.find(p => p.producer_id === producerId);
+    const user = usersInRoom.find(u => u.id === producer?.userId);
+    console.log("username is" , user?.name , user);
+    return user?.name || "Unknown";
+  };
 
+ 
 
   return (
+    <>
+    <Toaster position="bottom-left" richColors />
     <div className="bg-gradient-to-br from-zinc-900 via-black to-zinc-800 min-h-screen relative p-6">
       <h1 className="text-3xl font-semibold text-center mb-8 text-white tracking-wide">
         🎥 Video Calling App
       </h1>
+
+      {/* Hidden audio element */}
+    
 
       {/* Local Stream */}
       <section className="fixed bottom-6 right-6 z-50">
@@ -611,78 +674,135 @@ export default function Page() {
             ref={localStreamRef}
             className="w-full h-full object-contain"
           />
+          {!isVideoOn && (
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="w-24 h-24 rounded-full bg-gray-700 text-white flex items-center justify-center text-4xl font-semibold">
+                {username?.[0]?.toUpperCase() || "?"}
+              </div>
+            </div>
+          )}
 
           {/* Controls */}
-          <div className="absolute bottom-2 left-1/2 transform -translate-x-1/2 flex gap-4">
-            <button
-              onClick={turnMicOn}
-              className="bg-black/30 hover:bg-black/50 text-white p-2 rounded-full"
-            >
-              <Mic></Mic>
-            </button>
-            <button
-              onClick={turnVideoOn}
-              className="bg-black/30 hover:bg-black/50 text-white p-2 rounded-full"
-            >
-              <Video></Video>
-            </button>
+          {!isMicOn && (<div className="absolute top-2 right-2 text-white">
+            <MicOff></MicOff>
+          </div>)}
+
+          <div className="absolute bottom-2 left-2 text-white bg-black/50 px-2 rounded-sm ">
+            {username} (You)
           </div>
         </div>
       </section>
 
-      {/* Remote Video Streams */}
       <div
-        className={`
-          w-full gap-6 px-2 md:px-6 pb-20
-          ${remoteStream.length === 2 ? "grid grid-cols-1" : ""}
-          ${remoteStream.length === 4 ? "flex flex-col md:flex-row" : ""}
-          ${remoteStream.length === 6 ? "flex flex-wrap justify-center" : ""}
-          ${remoteStream.length > 6 ? "grid grid-cols-2 md:grid-cols-2" : ""}
-        `}
-        style={{ height: "100vh", overflow: "auto" }}
-      >
-        {remoteStream
-          .filter(({ kind }) => kind === "video")
-          .map(({ stream, producerId }, index) => (
-            <div
-              key={index}
-              className="rounded-xl overflow-hidden bg-white/5 backdrop-blur shadow-lg border border-white/10"
-              style={{
-                maxWidth:
-                  remoteStream.length === 2
-                    ? "100%"
-                    : remoteStream.length === 4
-                      ? "48%"
-                      : remoteStream.length === 6
-                        ? "30%"
-                        : "100%",
-              }}
-            >
-              {!pausedVideoProducerIds.includes(producerId) ? (
-                <video
-                  autoPlay
-                  playsInline
-                  muted
-                  className="w-full h-full object-contain aspect-video"
-                  ref={(videoElement) => {
-                    if (videoElement) {
-                      videoElement.srcObject = stream;
-                    }
-                  }}
-                />
-              ) : (
-                <div className="w-full h-full flex flex-col items-center justify-center bg-black text-white">
-                  <img
-                    src={"/default-avatar.png"}
-                    alt={`tiru's avatar`}
-                    className="w-16 h-16 rounded-full mb-2"
-                  />
-                  <span className="text-lg font-medium">{"Tiru"}</span>
-                </div>
-              )}
-            </div>
-          ))}
+  className={`
+    w-full gap-6 px-2 md:px-6 pb-20
+    ${remoteStream.length === 2 ? "grid grid-cols-1" : ""}
+    ${remoteStream.length === 4 ? "flex flex-col md:flex-row" : ""}
+    ${remoteStream.length === 6 ? "flex flex-wrap justify-center" : ""}
+    ${remoteStream.length > 6 ? "grid grid-cols-2 md:grid-cols-2" : ""}
+  `}
+  style={{ height: "100vh", overflow: "auto" }}
+>
+  {remoteStream.length === 0 ? (
+   <div className="w-full h-full flex flex-col items-center justify-center text-white text-xl bg-black/50 rounded-xl space-y-4">
+      {/* Pulsing dot */}
+    
+      {/* Ringing text animation */}
+      <div className="flex items-center space-x-1 font-semibold text-2xl">
+        <span>Ringing</span>
+        <span className="animate-bounce [animation-delay:0s]">.</span>
+        <span className="animate-bounce [animation-delay:0.2s]">.</span>
+        < span className="animate-bounce [animation-delay:0.4s]">.</span>
       </div>
+    </div>
+  
+  ) : (
+    remoteStream
+      .filter(({ kind }) => kind === "video")
+      .map(({ stream, producerId }, index) => {
+        const userName = getUserNameByProducerId(producerId);
+        const userInitial = userName?.[0]?.toUpperCase() || "?";
+        return (
+          <div
+            key={index}
+            className="relative rounded-xl overflow-hidden bg-white/5 backdrop-blur shadow-lg border border-white/10"
+            style={{
+              maxWidth:
+                remoteStream.length === 2
+                  ? "100%"
+                  : remoteStream.length === 4
+                    ? "48%"
+                    : remoteStream.length === 6
+                      ? "30%"
+                      : "100%",
+            }}
+          >
+            {!pausedVideoProducerIds.includes(producerId) ? (
+              <video
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-contain aspect-video"
+                ref={(videoElement) => {
+                  if (videoElement) {
+                    videoElement.srcObject = stream;
+                  }
+                }}
+              />
+            ) : (
+              <div className="w-full h-full aspect-video flex flex-col items-center justify-center bg-black text-white">
+                <div className="w-24 h-24 flex items-center justify-center rounded-full bg-gray-700 mb-2 text-4xl font-semibold">
+                  {userInitial}
+                </div>
+              </div>
+            )}
+
+            <div className="absolute bottom-2 left-2 md:text-lg bg-black/60 text-white text-sm px-2 py-1 rounded-md">
+              {userName}
+            </div>
+          </div>
+        );
+      })
+  )}
+</div>
+
+{/* Sticky End Call Button */}
+<div className="fixed bottom-4 left-1/2 transform -translate-x-1/2 z-50 flex gap-4 bg-black/70 p-4 rounded-full shadow-lg backdrop-blur-md border border-white/10">
+  {/* Mic Toggle */}
+  <button
+    onClick={turnMicOn}
+    className={`transition-all duration-300 ease-in-out hover:-translate-y-1 p-3 rounded-full ${
+      isMicOn ? "bg-white text-black hover:bg-gray-200" : "bg-gray-800 text-white hover:bg-gray-700"
+    }`}
+    title="Toggle Mic"
+  >
+    {isMicOn ? <Mic size={20} /> : <MicOff size={20} />}
+  </button>
+
+    {/* End Call */}
+    <button
+    // onClick={handleEndCall}
+    className="bg-red-600 hover:bg-red-700 text-white p-3 rounded-full transition-all duration-300 hover:-translate-y-1 ease-in-out"
+    title="End Call"
+  >
+    <Phone size={20} />
+  </button>
+
+  {/* Video Toggle */}
+  <button
+    onClick={turnVideoOn}
+    className={`transition-all duration-300 ease-in-out p-3 hover:-translate-y-1  rounded-full ${
+      isVideoOn ? "bg-white text-black hover:bg-gray-200" : "bg-gray-800 text-white hover:bg-gray-700"
+    }`}
+    title="Toggle Video"
+  >
+    {isVideoOn ? <Video size={20} /> : <VideoOff size={20} />}
+  </button>
+
+</div>
+
+
+
 
       {/* Remote Audio Streams */}
       <section>
@@ -702,6 +822,7 @@ export default function Page() {
           ))}
       </section>
     </div>
+    </>
   );
 
 

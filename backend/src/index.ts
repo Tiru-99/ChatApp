@@ -6,7 +6,6 @@ import { Server } from 'socket.io';
 import cors from 'cors'
 import { setupSocketIOServer } from './socket';
 import compression from 'compression';
-import { setUpMediaSoupServer } from './mediasoup';
 import { connectRedis } from './config/redis';
 import { startMessageConsumer } from './config/kafka';
 import { SocketService } from './mediasoup/SocketServer';
@@ -27,8 +26,8 @@ const io = new Server(server, {
   },
 });
 
-console.log(process.env.FRONTEND_URL);
-new SocketService(server); 
+
+new SocketService(io); 
 setupSocketIOServer(io);
 // setUpMediaSoupServer(io);
 
